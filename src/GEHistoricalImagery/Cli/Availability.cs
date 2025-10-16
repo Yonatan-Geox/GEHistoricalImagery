@@ -3,7 +3,9 @@ using LibEsri;
 using LibGoogleEarth;
 using LibMapCommon;
 using LibMapCommon.Geometry;
+using OSGeo.OGR;
 using System.Text;
+using System.Text.Json;
 
 namespace GEHistoricalImagery.Cli;
 
@@ -12,6 +14,9 @@ internal class Availability : AoiVerb
 {
 	[Option('p', "parallel", HelpText = "Number of concurrent downloads", MetaValue = "N", Default = 20)]
 	public int ConcurrentDownload { get; set; }
+
+	[Option('j', "json", HelpText = "Output GeoJSON to console")]
+	public bool OutputJson { get; set; }
 
 	public override async Task RunAsync()
 	{
@@ -40,10 +45,7 @@ internal class Availability : AoiVerb
 
 		var wayBack = await WayBack.CreateAsync(CacheDir);
 
-		Console.Write("Loading World Atlas WayBack Layer Info: ");
-
 		var all = await GetAllEsriRegions(wayBack, Region);
-		ReplaceProgress("Done!\r\n");
 
 		if (all.Sum(r => r.Availabilities.Length) == 0)
 		{
@@ -51,15 +53,22 @@ internal class Availability : AoiVerb
 			return;
 		}
 
-		OptionChooser<EsriRegion>.WaitForOptions(all);
+		if (OutputJson)
+		{
+			var mercAoi = Region.ToWebMercator();
+			var stats = mercAoi.GetPolygonalRegionStats<EsriTile>(ZoomLevel);
+			var allAvailabilities = all.SelectMany(r => r.Availabilities).ToArray();
+
+			WriteGeoJsonEsri(allAvailabilities, mercAoi, stats);
+		}
+		else
+		{
+			OptionChooser<EsriRegion>.WaitForOptions(all);
+		}
 	}
 
 	private async Task<EsriRegion[]> GetAllEsriRegions(WayBack wayBack, GeoRegion<Wgs1984> aoi)
 	{
-		int count = 0;
-		int numTiles = wayBack.Layers.Count;
-		ReportProgress(0);
-
 		var mercAoi = aoi.ToWebMercator();
 		var stats = mercAoi.GetPolygonalRegionStats<EsriTile>(ZoomLevel);
 
@@ -69,7 +78,6 @@ internal class Availability : AoiVerb
 		await foreach (var region in processor.EnumerateResults(wayBack.Layers.Select(getLayerDates)))
 		{
 			allLayers.Add(region);
-			ReportProgress(++count / (double)numTiles);
 		}
 
 		//De-duplicate list
@@ -89,7 +97,7 @@ internal class Availability : AoiVerb
 
 		return allLayers.OrderByDescending(l => l.Date).ToArray();
 
-		async Task<EsriRegion> getLayerDates(Layer layer)
+		async Task<EsriRegion> getLayerDates(LibEsri.Layer layer)
 		{
 			var regions = await wayBack.GetDateRegionsAsync(layer, mercAoi, ZoomLevel);
 
@@ -115,9 +123,9 @@ internal class Availability : AoiVerb
 		}
 	}
 
-	private class EsriRegion(Layer layer, RegionAvailability[] regions) : IConsoleOption
+	private class EsriRegion(LibEsri.Layer layer, RegionAvailability[] regions) : IConsoleOption
 	{
-		public Layer Layer { get; } = layer;
+		public LibEsri.Layer Layer { get; } = layer;
 		public RegionAvailability[] Availabilities { get; } = regions;
 
 		public DateOnly Date => Layer.Date;
@@ -151,10 +159,8 @@ internal class Availability : AoiVerb
 	private async Task Run_Keyhole()
 	{
 		var root = await DbRoot.CreateAsync(Database.TimeMachine, CacheDir);
-		Console.Write("Loading Quad Tree Packets: ");
 
 		var all = await GetAllDatesAsync(root, Region);
-		ReplaceProgress("Done!\r\n");
 
 		if (all.Length == 0)
 		{
@@ -162,14 +168,21 @@ internal class Availability : AoiVerb
 			return;
 		}
 
-		OptionChooser<RegionAvailability>.WaitForOptions(all);
+		if (OutputJson)
+		{
+			var stats = Region.GetPolygonalRegionStats<KeyholeTile>(ZoomLevel);
+
+			WriteGeoJsonKeyhole(all, Region, stats);
+		}
+		else
+		{
+			OptionChooser<RegionAvailability>.WaitForOptions(all);
+		}
 	}
 
 	private async Task<RegionAvailability[]> GetAllDatesAsync(DbRoot root, GeoRegion<Wgs1984> reg)
 	{
-		int count = 0;
 		var stats = reg.GetPolygonalRegionStats<KeyholeTile>(ZoomLevel);
-		ReportProgress(0);
 
 		ParallelProcessor<List<DatedTile>> processor = new(ConcurrentDownload);
 
@@ -192,8 +205,6 @@ internal class Availability : AoiVerb
 				uniquePoints.Add(new Tuple<int, int>(rIndex, cIndex));
 				region[rIndex, cIndex] = await root.GetNodeAsync(d.Tile) is not null;
 			}
-
-			ReportProgress(++count / (double)stats.TileCount);
 		}
 
 		//Go back and mark unavailable tiles within the region of interest
@@ -324,5 +335,281 @@ internal class Availability : AoiVerb
 			}
 		}
 	}
+
+	private void WriteGeoJsonKeyhole(RegionAvailability[] availabilities, GeoRegion<Wgs1984> region, TileStats stats)
+	{
+		using var stream = Console.OpenStandardOutput();
+		using var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true });
+
+		writer.WriteStartObject();
+		writer.WriteString("type", "FeatureCollection");
+		writer.WriteStartArray("features");
+
+		foreach (var availability in availabilities)
+		{
+			// Collect all available tiles for this date
+			var multiPolygon = new Geometry(wkbGeometryType.wkbMultiPolygon);
+
+			for (int r = 0; r < availability.Height; r++)
+			{
+				for (int c = 0; c < availability.Width; c++)
+				{
+					var isAvailable = availability[r, c];
+					if (isAvailable == null || isAvailable == false)
+						continue;
+
+					var tileRow = stats.MaxRow - r;
+					var tileColumn = (c + stats.MinColumn) % (1 << ZoomLevel);
+					var tile = KeyholeTile.Create(tileRow, tileColumn, ZoomLevel);
+
+					// Create polygon for this tile and add to collection
+					using var polygon = CreateTilePolygon(tile);
+					multiPolygon.AddGeometry(polygon);
+				}
+			}
+
+			// Merge all adjacent polygons using OGR's Union operation
+			if (multiPolygon.GetGeometryCount() > 0)
+			{
+				using var merged = multiPolygon.UnionCascaded();
+				WriteOgrGeometryToGeoJson(writer, merged, availability.Date);
+			}
+
+			multiPolygon.Dispose();
+		}
+
+		writer.WriteEndArray();
+		writer.WriteEndObject();
+	}
+
+	private void WriteGeoJsonEsri(RegionAvailability[] availabilities, GeoRegion<WebMercator> region, TileStats stats)
+	{
+		using var stream = Console.OpenStandardOutput();
+		using var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true });
+
+		writer.WriteStartObject();
+		writer.WriteString("type", "FeatureCollection");
+		writer.WriteStartArray("features");
+
+		foreach (var availability in availabilities)
+		{
+			// Collect all available tiles for this date
+			var multiPolygon = new Geometry(wkbGeometryType.wkbMultiPolygon);
+
+			for (int r = 0; r < availability.Height; r++)
+			{
+				for (int c = 0; c < availability.Width; c++)
+				{
+					var isAvailable = availability[r, c];
+					if (isAvailable == null || isAvailable == false)
+						continue;
+
+					var tileRow = r + stats.MinRow;
+					var tileColumn = (c + stats.MinColumn) % (1 << ZoomLevel);
+					var tile = EsriTile.Create(tileRow, tileColumn, ZoomLevel);
+
+					// Create polygon for this tile and add to collection
+					using var polygon = CreateTilePolygon(tile);
+					multiPolygon.AddGeometry(polygon);
+				}
+			}
+
+			// Merge all adjacent polygons using OGR's Union operation
+			if (multiPolygon.GetGeometryCount() > 0)
+			{
+				using var merged = multiPolygon.UnionCascaded();
+				WriteOgrGeometryToGeoJson(writer, merged, availability.Date);
+			}
+
+			multiPolygon.Dispose();
+		}
+
+		writer.WriteEndArray();
+		writer.WriteEndObject();
+	}
+
+	private static void WriteTileFeature(Utf8JsonWriter writer, ITile<Wgs1984> tile, DateOnly date, bool isAvailable)
+	{
+		writer.WriteStartObject(); // Feature
+		writer.WriteString("type", "Feature");
+
+		// Geometry
+		writer.WriteStartObject("geometry");
+		writer.WriteString("type", "Polygon");
+		writer.WriteStartArray("coordinates");
+		writer.WriteStartArray(); // Outer ring
+
+		// Write coordinates as [longitude, latitude]
+		WriteCoordinate(writer, tile.LowerLeft);
+		WriteCoordinate(writer, tile.UpperLeft);
+		WriteCoordinate(writer, tile.UpperRight);
+		WriteCoordinate(writer, tile.LowerRight);
+		WriteCoordinate(writer, tile.LowerLeft); // Close the ring
+
+		writer.WriteEndArray(); // End outer ring
+		writer.WriteEndArray(); // End coordinates array
+		writer.WriteEndObject(); // End geometry
+
+		// Properties
+		writer.WriteStartObject("properties");
+		writer.WriteString("date", date.ToString("yyyy-MM-dd"));
+		writer.WriteBoolean("available", isAvailable);
+		writer.WriteNumber("row", tile.Row);
+		writer.WriteNumber("column", tile.Column);
+		writer.WriteNumber("level", tile.Level);
+		writer.WriteEndObject(); // End properties
+
+		writer.WriteEndObject(); // End feature
+	}
+
+	private static void WriteTileFeature(Utf8JsonWriter writer, ITile<WebMercator> tile, DateOnly date, bool isAvailable)
+	{
+		writer.WriteStartObject(); // Feature
+		writer.WriteString("type", "Feature");
+
+		// Geometry
+		writer.WriteStartObject("geometry");
+		writer.WriteString("type", "Polygon");
+		writer.WriteStartArray("coordinates");
+		writer.WriteStartArray(); // Outer ring
+
+		// Write coordinates as [longitude, latitude] - convert WebMercator to WGS84
+		WriteCoordinate(writer, tile.LowerLeft.ToWgs1984());
+		WriteCoordinate(writer, tile.UpperLeft.ToWgs1984());
+		WriteCoordinate(writer, tile.UpperRight.ToWgs1984());
+		WriteCoordinate(writer, tile.LowerRight.ToWgs1984());
+		WriteCoordinate(writer, tile.LowerLeft.ToWgs1984()); // Close the ring
+
+		writer.WriteEndArray(); // End outer ring
+		writer.WriteEndArray(); // End coordinates array
+		writer.WriteEndObject(); // End geometry
+
+		// Properties
+		writer.WriteStartObject("properties");
+		writer.WriteString("date", date.ToString("yyyy-MM-dd"));
+		writer.WriteNumber("level", tile.Level);
+		writer.WriteEndObject(); // End properties
+
+		writer.WriteEndObject(); // End feature
+	}
+
+	private static void WriteCoordinate(Utf8JsonWriter writer, Wgs1984 coordinate)
+	{
+		writer.WriteStartArray();
+		writer.WriteNumberValue(coordinate.Longitude);
+		writer.WriteNumberValue(coordinate.Latitude);
+		writer.WriteEndArray();
+	}
+
+	/// <summary>
+	/// Creates an OGR Polygon geometry from a tile's corners
+	/// </summary>
+	private static Geometry CreateTilePolygon(ITile<Wgs1984> tile)
+	{
+		var ring = new Geometry(wkbGeometryType.wkbLinearRing);
+
+		// Add points in counter-clockwise order (GeoJSON standard)
+		ring.AddPoint_2D(tile.LowerLeft.Longitude, tile.LowerLeft.Latitude);
+		ring.AddPoint_2D(tile.UpperLeft.Longitude, tile.UpperLeft.Latitude);
+		ring.AddPoint_2D(tile.UpperRight.Longitude, tile.UpperRight.Latitude);
+		ring.AddPoint_2D(tile.LowerRight.Longitude, tile.LowerRight.Latitude);
+		ring.AddPoint_2D(tile.LowerLeft.Longitude, tile.LowerLeft.Latitude); // Close the ring
+
+		var polygon = new Geometry(wkbGeometryType.wkbPolygon);
+		polygon.AddGeometry(ring);
+
+		return polygon;
+	}
+
+	/// <summary>
+	/// Creates an OGR Polygon geometry from a WebMercator tile (converts to WGS84)
+	/// </summary>
+	private static Geometry CreateTilePolygon(ITile<WebMercator> tile)
+	{
+		var ring = new Geometry(wkbGeometryType.wkbLinearRing);
+
+		// Convert to WGS84 and add points in counter-clockwise order
+		var ll = tile.LowerLeft.ToWgs1984();
+		var ul = tile.UpperLeft.ToWgs1984();
+		var ur = tile.UpperRight.ToWgs1984();
+		var lr = tile.LowerRight.ToWgs1984();
+
+		ring.AddPoint_2D(ll.Longitude, ll.Latitude);
+		ring.AddPoint_2D(ul.Longitude, ul.Latitude);
+		ring.AddPoint_2D(ur.Longitude, ur.Latitude);
+		ring.AddPoint_2D(lr.Longitude, lr.Latitude);
+		ring.AddPoint_2D(ll.Longitude, ll.Latitude); // Close the ring
+
+		var polygon = new Geometry(wkbGeometryType.wkbPolygon);
+		polygon.AddGeometry(ring);
+
+		return polygon;
+	}
+
+	/// <summary>
+	/// Writes an OGR Geometry (Polygon or MultiPolygon) to GeoJSON with date property
+	/// </summary>
+	private static void WriteOgrGeometryToGeoJson(Utf8JsonWriter writer, Geometry geometry, DateOnly date)
+	{
+		var geomType = geometry.GetGeometryType();
+
+		if (geomType == wkbGeometryType.wkbPolygon)
+		{
+			WritePolygonFeature(writer, geometry, date);
+		}
+		else if (geomType == wkbGeometryType.wkbMultiPolygon)
+		{
+			// Write each polygon as a separate feature
+			int count = geometry.GetGeometryCount();
+			for (int i = 0; i < count; i++)
+			{
+				using var polygon = geometry.GetGeometryRef(i);
+				WritePolygonFeature(writer, polygon, date);
+			}
+		}
+	}
+
+	private static void WritePolygonFeature(Utf8JsonWriter writer, Geometry polygon, DateOnly date)
+	{
+		writer.WriteStartObject(); // Feature
+		writer.WriteString("type", "Feature");
+
+		// Geometry
+		writer.WriteStartObject("geometry");
+		writer.WriteString("type", "Polygon");
+		writer.WriteStartArray("coordinates");
+
+		// Outer ring (index 0)
+		if (polygon.GetGeometryCount() > 0)
+		{
+			using var ring = polygon.GetGeometryRef(0);
+			writer.WriteStartArray();
+
+			int pointCount = ring.GetPointCount();
+			for (int i = 0; i < pointCount; i++)
+			{
+				double[] point = new double[3];
+				ring.GetPoint(i, point);
+
+				writer.WriteStartArray();
+				writer.WriteNumberValue(point[0]); // Longitude
+				writer.WriteNumberValue(point[1]); // Latitude
+				writer.WriteEndArray();
+			}
+
+			writer.WriteEndArray();
+		}
+
+		writer.WriteEndArray(); // End coordinates
+		writer.WriteEndObject(); // End geometry
+
+		// Properties
+		writer.WriteStartObject("properties");
+		writer.WriteString("date", date.ToString("yyyy-MM-dd"));
+		writer.WriteEndObject(); // End properties
+
+		writer.WriteEndObject(); // End feature
+	}
+
 	#endregion
 }

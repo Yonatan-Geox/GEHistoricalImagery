@@ -8,7 +8,7 @@ Tiles that are available from a specific date are shaded, unavailable tiles are 
 To learn about defining a region of interest, please refer to the [Regions of Interest article](./regions.md).
 ## Usage
 ```Console
-GEHistoricalImagery availability [--region=[Lat0,Long0+Lat1,Long1+Lat2,Long2+..]] [--lower-left [LAT,LONG]] [--upper-right [LAT,LONG]] --zoom [N] [--parallel [N]] [--provider [P]] [--no-cache]
+GEHistoricalImagery availability [--region=[Lat0,Long0+Lat1,Long1+Lat2,Long2+..]] [--lower-left [LAT,LONG]] [--upper-right [LAT,LONG]] --zoom [N] [--parallel [N]] [--provider [P]] [--json] [--no-cache]
 
   -p N, --parallel=N                           (Default: 20) Number of concurrent downloads
 
@@ -26,6 +26,8 @@ GEHistoricalImagery availability [--region=[Lat0,Long0+Lat1,Long1+Lat2,Long2+..]
 
   -z N, --zoom=N                               Required. Zoom level [1-23]
 
+  -j, --json                                   Output GeoJSON to console
+
   --provider=TM                                (Default: TM) Aerial imagery provider
                                                 [TM]      Google Earth Time Machine
                                                 [Wayback] ESRI World Imagery Wayback
@@ -42,7 +44,6 @@ GEHistoricalImagery availability --lower-left 39.619819,-104.856121 --upper-righ
 ```
 **Output:**
 ```Console
-Loading Quad Tree Packets: Done!
 [0]  2024/06/05  [1]  2023/09/05  [2]  2023/05/28  [3]  2023/04/29  [4]  2022/09/26
 [5]  2021/08/17  [6]  2021/06/15  [7]  2021/06/11  [8]  2020/10/03  [9]  2020/09/30
 [a]  2020/06/07  [b]  2019/10/03  [c]  2019/09/13  [d]  2018/06/01  [e]  2017/06/10
@@ -170,7 +171,6 @@ GEHistoricalImagery availability --zoom 20 --region 39.619819,-104.856121+39.632
 ```
 **Output:**
 ```Console
-Loading Quad Tree Packets: Done!
 [0]  2025/03/03  [1]  2024/06/05  [2]  2023/10/20  [3]  2023/09/05  [4]  2023/05/28
 [5]  2023/04/29  [6]  2022/09/26  [7]  2021/08/17  [8]  2021/06/15  [9]  2021/06/11
 [a]  2020/10/03  [b]  2020/09/30  [c]  2020/06/07  [d]  2019/10/03  [e]  2019/09/13
@@ -210,6 +210,48 @@ Loading Quad Tree Packets: Done!
 ˙˙˙˙˙˙˙˙˙˙˙˙˙˙˙˙˙˙˙˙˙˙˙˙˙˙˙˙▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 ```
 This diagram, shown by pressing `5` in the console, shows the tiles with available imagery from 2023/04/29. The shaded areas represent tiles which contain imagery for the selected date, the dots represent tiles which have no imagery for the selected date, and the empty area show space outside of the polygonal region.
+
+## Example 3 - GeoJSON Output
+Gets the availability as GeoJSON output to console, which can be redirected to a file or piped to other tools.
+
+**Command:**
+```console
+GEHistoricalImagery availability --lower-left 39.619819,-104.856121 --upper-right 39.638393,-104.824990 --zoom 20 --json
+```
+
+**Output:**
+```json
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-104.856121, 39.619819],
+            [-104.856121, 39.638393],
+            [-104.824990, 39.638393],
+            [-104.824990, 39.619819],
+            [-104.856121, 39.619819]
+          ]
+        ]
+      },
+      "properties": {
+        "date": "2024-06-05",
+        "available": true
+      }
+    },
+    ...
+  ]
+}
+```
+
+The GeoJSON output can be redirected to a file:
+```console
+GEHistoricalImagery availability --lower-left 39.619819,-104.856121 --upper-right 39.638393,-104.824990 --zoom 20 --json > availability.geojson
+```
 
 ************************
 <p align="center"><i>Updated 2025/06/20</i></p>
